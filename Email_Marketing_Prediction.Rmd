@@ -1,0 +1,315 @@
+---
+title: "Email Marketing Analysis"
+author: "Nithish Vengadesan"
+date: "2022-11-15"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(plyr) # for data encoding
+library(mltools)# for one_hot()
+library(data.table) # for as.data.table()
+library(caTools) # for data partitioning
+library(FSelector) # for feature Selection
+library(caret) # for computing Confusion matrix
+library(pROC) # for ROC chart
+library(CustomerScoringMetrics) #for gain chart
+library(e1071) # for SVM
+library(randomForest) # for Random Forest
+```
+
+
+---
+
+# Data Dictionary
+
+Variable          | Description
+----------------- | --------------------------------------------------------------
+`Customer_ID`     | Customer identification number
+`recency`         | Months since last purhcase before the marketing campaign
+`purchase_segment`| Categorisation for the purhase amount in the past year before the marketing campaign. There are 7 Categories: 1) 0 - 100 : the purchase amount is between 0 and £100; 2) 100 - 200: the purchase amount is between £100 and £200; 3) 200 - 350; 4) 350 - 500; 5) 500 - 750 6) 750 - 1,000 7) 1,000+
+`purchase`        | Actual purchase in the past year before the marketing campaign
+`mens`            | Whether the customer purchased men's merchandise in the past year before the marketing campaign (1 = purchased, 0 = not)
+`womens`          | Whether the customer purchased women's merchandise in the past year before the marketing campaign (1= purchased, 0 = not)
+`zip_area`        | Categorisation of zip code as Urban, Suburban, or Rural
+`new_customer`    | Whether the customer is new in the past year or s/he is an existing customer (1 = new customer, 0 = existing customer)
+`channel`         | Categorisation of the channels the customer purchased from in the past year. The categories are Phone, Web and Multichannel 
+`email_segment`   | E-mail campaign the customer received.There 3 categories: 1) Mens E-mail: The customer received an email marketing campaign for men's products; 2) Womens E-mail: The customer received an email marketing campaign for women's products; 3) No E-mail: The customer did not receive an email.
+`age`             | Age of the customer in years
+`dependent`       | Whether the customer has a dependent受供养者 or not (1 = yes; 0 = no)
+`account`         | Whether the customer has an account or not (1 = yes; 0 = no)
+`employed`        | Whether the customer has a permenant job (1 = yes; 0 = no)
+`phone`           | Whether the customer registered his/her phone or not (1 = yes; 0 = no)
+`delivery`        | Categorisation for the delivery address (1 = home; 2 = work; 3 = multiple)
+`marriage`        | Marital status (1=married, 2=single, 0 = others)
+`payment_card`    | Whether the customer registered a credit card for payment in the past year (1 = yes; 0 = no)
+`spend`           | Total amount spent in the following two weeks period
+`visit`           | 1: the customer visited the shop in the following two weeks period; 0: the customer did not visit the shop in the following two weeks period.
+--- 
+
+# Data Preparation
+
+```{r}
+# Import data and save it as data
+data <- read.csv("Emailmarketing_data.csv", stringsAsFactors = T)
+
+# Check the structure of the variables in the dataset by using str() function
+str(data)
+
+# Check the summary of the dataset
+summary(data)
+
+# Note: When creating an email marketing campaign and predicting whether customers will be the target group, we cannot know the total amount spent during the period of email marketing campaign in advance. So we need to delete "spend". In addition,  "Customer_ID" and "account" should be removes as well, since they are useless for our model.
+
+# Remove unrelated variables: Customer_ID, account, spend
+data[c("Customer_ID", "account","spend")] <- NULL
+
+# Generate a vector to keep the column names
+columns <- c("delivery", "marriage", "visit")
+
+# Set the correct measurement levels or data types
+data[columns] <- lapply(data[columns], as.factor)
+
+# Apply label encoding to "delivery", "marriage"
+data$delivery <- revalue(data$delivery, c("1" = "home", "2" = "work", "3" = "multiple"))
+data$marriage <- revalue(data$marriage, c("1" = "married", "2" = "single", "0" = "others"))
+
+# Replace missing values of "purchase_segment" according to "purchase"
+data$purchase_segment <- ifelse(!is.na(data$purchase_segment),data$purchase_segment, ifelse(data$purchase>1000, "7", ifelse(data$purchase>750, "6", ifelse(data$purchase>500, "5", ifelse(data$purchase>350, "4", ifelse(data$purchase>200, "3", ifelse(data$purchase, "2", "1")))))))
+
+# Save "purchase_segment" as a numerical variable
+data$purchase_segment <- as.numeric(data$purchase_segment)
+
+# Check the structure of the dataset again
+str(data)
+
+
+# Data quality checks and visualisation of continuous variables
+# Use bar chart and boxplot to check "purchase", "age"
+## First examine "purchase".
+ggplot(data) + geom_histogram(aes(purchase), bins = 50)
+boxplot(data$purchase)
+filter(data, purchase>3000)
+# Also examine "age"
+ggplot(data) + geom_histogram(aes(age), bins = 50)
+boxplot(data$age)
+# Note: from the plots we can see there are some values which seems like outliers but reasonable, so we don't need to handle them.
+
+
+# Apply one hot encoding to the nominal variable "zip_area", "channel", "email_segment", "delivery", "marriage"
+data_new <- one_hot(as.data.table(data), cols=c("zip_area","channel", "email_segment","delivery", "marriage" ))
+summary(data_new)
+```
+
+# Data modeling
+
+* Split the dataset into the training set (75%) and test set (25%)
+```{r}
+# Set a seed of 123 by using set.seed() function
+set.seed(123)
+
+# Generate split vector to partition the data into training and test sets with training ratio of 0.75
+split = sample.split(data_new$visit, SplitRatio = 0.75)  
+
+# Generate the training and test sets by subsetting the data records from original dataset
+training = subset(data_new, split == TRUE) 
+
+test = subset(data_new, split == FALSE) 
+
+# The proportion of customers who visited the shop in the following two weeks period is 84.16%, and the proportion of customers who did not visit the shop is 15.84%. We think the data does not need to be balanced.
+prop.table(table(data_new$visit))
+
+prop.table(table(training$visit))
+
+prop.table(table(test$visit))
+
+# Use function information.gain to compute information gain values of the attributes
+attribute_weights <- information.gain(visit ~., training)
+
+# Print weights
+print(attribute_weights)
+
+# Save a copy of the weights
+df <- attribute_weights
+
+# Add row names as a column to keep them during ordering
+df$attr <- rownames(attribute_weights)
+
+# Sort the weights in decreasing order of information gain values.
+df <- arrange(df, -df$attr_importance)
+
+# Plot the weight
+barplot(df$attr_importance, names = df$attr, las = 2, ylim = c(0, 0.06))
+
+# Filter features where the information gain is not zero
+filter(df, attr_importance > 0)
+
+# Use cutoff.k() to find the most informative 18 attributes
+filtered_attributes <- cutoff.k(attribute_weights, 18)
+
+# Print filtered attributes
+print(filtered_attributes)
+
+# Select a subset of the dataset by using filtered_attributes
+# datamodelling <- training[filtered_attributes] #this line of code will give an error
+datamodeling <- training %>% select(all_of(filtered_attributes))
+
+# Add class column to the filtered dataset for modelling
+datamodeling$visit <- training$visit
+
+```
+
+***
+
+
+**Logistic Regression Model**
+
+```{r}
+# Build a logistic regression model assign it to LogReg
+LogReg <- glm(visit~. , data = datamodeling, family = "binomial")
+
+# Predict the "visit" probabilities of the test data
+LogReg_pred <- predict(LogReg, test, type="response")
+
+# Predict the "visit", default cutoff value/threshold = 0.5
+LOGREG_visit <- ifelse(LogReg_pred > 0.5, 1,0)
+
+# Save the predictions as factor variables
+LOGREG_visit <- as.factor(LOGREG_visit)
+
+# Create a confusion matrix by comparing the column “visit” in the test data with the vector predictions of logistic regression model.
+confusionMatrix(LOGREG_visit, test$visit, positive='1', mode = "prec_recall")
+```
+
+***
+
+**SVM**
+
+```{r}
+# Build SVM model and assign it to SVM_model
+SVM_model <- svm(visit~. , data = datamodeling, kernel= "radial", scale = TRUE, probability = TRUE)
+
+# Predict the class of the test data
+SVM_pred <- predict(SVM_model, test, probability = TRUE)
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVM_pred, test$visit, positive = "1", mode = "prec_recall")
+summary(SVM_model)
+
+## The performance of SVM model can be very sensitive to the choice of the cost parameter (this depends on the dataset). So we use tune() function to search for the best cost parameter for this dataset. 
+# set a seed 
+set.seed(123)
+
+# how to determine the cost of SVM which will be tested: We set several ratios with significant differences (from large to small) and finally selected the best cost value by tune function. ???
+# Find the best cost value among the list (0.5,0.8,1.2,1.5,1.8,2)
+tune_out = tune(svm, visit~., data = datamodeling, kernel= "radial", scale = TRUE, 
+                ranges =list(cost = c(0.5,0.8,1.2,1.5,1.8,2)))
+
+# Save the best model as svm_best
+svm_best = tune_out$best.model
+
+summary(svm_best)
+
+# Predict the "visit" of the test data 
+SVMbest.predictions <- predict(svm_best, test)
+
+# Use confusionMatrix to print the performance of SVM model
+confusionMatrix(SVMbest.predictions, test$visit, positive = "1", mode = "prec_recall")
+```
+
+***
+
+**Random Forest**
+
+```{r}
+# Set random seed
+set.seed(123)
+
+# Copy datamodeling and test dataset and save as datamodeling_new and test_new. Convert variable names of datamodeling_new and test_new dataset to all be legal
+datamodeling_new <- datamodeling
+test_new <- test
+names(datamodeling_new) <- make.names(names(datamodeling_new))
+names(test_new) <- make.names(names(test_new))
+
+# Build Random Forest model and assign it to RF_model
+RF_model <- randomForest(visit~., datamodeling_new)
+print(RF_model)
+
+# Predict the "visit" of the test data
+RF_pred <- predict(RF_model, test_new)
+
+# Confusion matrix
+confusionMatrix(RF_pred, test_new$visit, positive='1', mode = "prec_recall")
+```
+
+
+***
+
+# Model Evaluation
+
+```{r}
+# Obtain class probabilities by using predict() and adding type = "prob" for Random Forest
+RF_prob <- predict(RF_model, test_new, type = "prob")  # Check the output for churn probabilties
+
+# Add probability = TRUE for SVM    Why don't best model??(it will show wrong)
+SVM_pred <- predict(SVM_model, test, probability = TRUE)
+
+# Add probability = TRUE for SVM
+SVM_prob <- attr(SVM_pred, "probabilities")  # Check the output for churn probabilties
+
+
+# Logistic Regression
+ROC_LogReg <- roc(test$visit, LogReg_pred)
+
+# Random Forest
+ROC_RF <- roc(test_new$visit, RF_prob[,2])
+
+# SVM
+ROC_SVM <- roc(test$visit, SVM_prob[,2])
+
+# Plot the ROC curve for Logistic Regression, SVM and Random Forest
+ggroc(list(LogReg = ROC_LogReg, SVM = ROC_SVM, RF = ROC_RF), legacy.axes=TRUE)+ xlab("FPR") + ylab("TPR") +
+   geom_abline(intercept = 0, slope = 1, color = "darkgrey", linetype = "dashed")
+
+#Calculate the area under the curve (AUC) for Logistic Regression 
+auc(ROC_LogReg)
+
+#Calculate the area under the curve (AUC) for SVM 
+auc(ROC_SVM)
+
+#Calculate the area under the curve (AUC) for Random Forest 
+auc(ROC_RF)
+
+# Obtain cumulative gains table for Logistic Regression
+GainTable_LogReg <- cumGainsTable(LogReg_pred, test$visit, resolution = 1/100)
+
+# Obtain cumulative gains table for SVM
+GainTable_SVM <- cumGainsTable(SVM_prob[,2], test$visit, resolution = 1/100)
+
+# Obtain cumulative gains table for Random Forest
+GainTable_RF <- cumGainsTable(RF_prob[,2], test_new$visit, resolution = 1/100)
+
+# Plot the gain chart
+
+plot(GainTable_LogReg[,4], col="red", type="l",    
+xlab="Percentage of test instances", ylab="Percentage of correct predictions")
+lines(GainTable_SVM[,4], col="green", type ="l")
+lines(GainTable_RF[,4], col="blue", type ="l")
+grid(NULL, lwd = 1)
+
+legend("bottomright",
+c("LogReg", "SVM", "Random Forest"),
+fill=c("red","green", "blue"))
+```
+
+
+Questions to be answered:
+
+1. In Model evaluation, why does this code (SVM_pred <- predict(SVM_model, test, probability = TRUE)) use SVM_model instead of svm_best? 
+
+2. Do we need to consider the multicollinearity problem of Logistic Model and SVM? (we have used "purchase" and "purchase_segment" at the same time )
+
